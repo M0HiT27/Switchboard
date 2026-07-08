@@ -1,6 +1,8 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
+const PROTECTED_PATHS = ['/dashboard']
+
 export async function proxy(request: NextRequest) {
     let response = NextResponse.next({ request })
 
@@ -25,9 +27,17 @@ export async function proxy(request: NextRequest) {
         }
     )
 
-    // Refreshes the session if expired -- required so Server Components see a
-    // valid session on every request.
-    await supabase.auth.getUser()
+    const {
+        data: { user },
+    } = await supabase.auth.getUser()
+
+    const isProtected = PROTECTED_PATHS.some((path) =>
+        request.nextUrl.pathname.startsWith(path)
+    )
+
+    if (isProtected && !user) {
+        return NextResponse.redirect(new URL('/login', request.url))
+    }
 
     return response
 }

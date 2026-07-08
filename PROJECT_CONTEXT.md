@@ -25,11 +25,10 @@ Deadline: 72 hours from start (check original message timestamp for exact cutoff
   (writes, dedup, config reads, Realtime, RLS-scoped reads). Dedup is handled via a
   unique DB constraint + `insert ... on conflict do nothing` semantics.
 - **Auth:** Supabase Auth (not NextAuth) — avoids running a second service. Discord
-  OAuth is the provider for admin login. **Discord OAuth credentials set up in
-  Supabase; full app-side login flow now implemented** (cookie-aware auth clients
-  in `supabase-auth.ts`, `proxy.ts`, `/login`, `/auth/callback`, dashboard auth
-  guard) — see "Progress so far" below. **Not yet verified working end-to-end in
-  the browser — this is the next thing to test.**
+  OAuth is the provider for admin login. **CONFIRMED WORKING LIVE end-to-end**
+  (cookie-aware auth clients split across `supabase-auth-browser.ts` /
+  `supabase-auth-server.ts`, `proxy.ts`, `/login`, `/auth/callback`, dashboard
+  auth guard) — see "Progress so far" below.
 - **Multi-tenancy: pursuing the "multi-server support" stretch goal.** Each admin
   only sees data for Discord servers (guilds) they've explicitly connected —
   enforced via Postgres Row Level Security (RLS), not just app-level filtering. See
@@ -214,21 +213,126 @@ auth work, not otherwise detailed here). Not yet linked to `/login`.
     own callback URL (`https://<project-ref>.supabase.co/auth/v1/callback`), not
     the app's `/auth/callback` — these are two different URLs in the flow and
     it's easy to put the app URL in the wrong place.
-  - Full login flow not yet clicked through live (Discord → Supabase → app
-    callback → dashboard redirect). **This is the very next thing to test.**
+  - **CONFIRMED WORKING LIVE**: full login flow clicked through end-to-end
+    (Discord → Supabase → app callback → dashboard redirect). Also fixed a
+    Next.js 16 `middleware.ts` → `proxy.ts` rename issue along the way (function
+    export renamed `middleware` → `proxy`, now runs on Node.js runtime not
+    Edge), and moved the auth redirect for `/dashboard` into `proxy.ts` itself
+    (not just the page-level guard) to eliminate a flash of dashboard content
+    before redirecting unauthenticated users — `proxy.ts` now returns a clean
+    `307` straight to `/login` with no dashboard HTML ever sent. Page-level
+    `redirect('/login')` guard kept as defense-in-depth per Next's own guidance
+    not to rely on proxy/middleware as the sole auth boundary. Residual brief
+    white flash during the redirect hop itself is normal browser redirect
+    behavior, not a bug — not chasing further.
+  - **Bug fix note:** `supabase-auth.ts` originally combined both the browser
+    and server auth clients in one file. This broke because the server client
+    imports `next/headers`, and bundling both into one module meant any Client
+    Component importing from it (e.g. `/login`) pulled in `next/headers`
+    client-side, which doesn't exist there. **Fixed by splitting into two
+    files**, matching the discipline already used for `supabase-browser.ts` /
+    `supabase-server.ts`:
+    - `src/lib/supabase/supabase-auth-browser.ts` → `createAuthBrowserClient()`
+    - `src/lib/supabase/supabase-auth-server.ts` → `createAuthServerClient()`
+    (The earlier combined `supabase-auth.ts` file no longer exists — any
+    reference to it elsewhere in this doc from an earlier session is stale.)
+
+### "Connect a server" flow — DONE, confirmed working live
+- **Design decision made this session:** rejected the originally-planned manual
+  form (admin pastes a Discord Guild ID, backend verifies the bot is present) in
+  favor of Discord's own OAuth2 bot-install flow with a server picker. This is
+  strictly better UX — the admin picks their server from Discord's native UI,
+  which invites the bot in the same step, instead of two separate manual steps
+  (invite bot elsewhere, then correctly copy-paste its guild ID here). It also
+  removes a class of user error (typos, or claiming a guild the bot was never
+  added to and getting a confusing rejection).
+- **Files (actual locations — note these are NOT under `src/app/dashboard/`,
+  a different layout convention than originally sketched):**
+  - `src/ui/components/Dashboard/add-server-button.tsx` — plain anchor tag
+    linking to Discord's OAuth2 authorize URL. No client component needed;
+    Discord handles the picker/invite flow entirely on its own domain.
+  - `src/app/dashboard/page.tsx` — builds the invite URL server-side:
+    `https://discord.com/oauth2/authorize` with `client_id`
+    (`DISCORD_APPLICATION_ID`), `scope=bot applications.commands`,
+    `permissions=2048` (Send Messages — sufficient for replying to slash
+    commands and posting to the mirror channel; regenerate via Discord
+    Developer Portal → OAuth2 → URL Generator and update this integer if more
+    permissions are ever needed), `response_type=code`, and `redirect_uri`
+    pointing at the new callback below. Also queries and displays the current
+    user's connected guilds from `admin_guilds` (RLS-scoped, so only their own
+    rows).
+  - **New route:** `src/app/api/discord/callback/route.ts` — Discord redirects
+    here after the admin picks a server and approves. Reads `guild_id` from the
+    query string (no manual entry needed — Discord provides it directly since
+    the bot-install scope was requested). Confirms the current Supabase user via
+    `createAuthServerClient()`, re-verifies the bot is actually in that guild as
+    cheap insurance against a stale/replayed redirect (`GET /guilds/{guild_id}`
+    with the bot token), then writes to `admin_guilds` AND seeds default
+    `command_configs` rows for `/report` and `/status` (both `enabled: true`, no
+    rule, no mirror override — falls back to
+    `admin_guilds.default_mirror_channel_id` once that's set), all via the
+    secret-key client (`createServerSupabaseClient()` from
+    `supabase-server.ts`), since seeding `command_configs` has no RLS-safe
+    insert-for-self path for a logged-in user. Uses `upsert` with
+    `onConflict`/`ignoreDuplicates` on both writes, so re-adding an
+    already-connected guild is safe and won't clobber configuration the admin
+    has since customized.
+  - **This is a THIRD distinct redirect URI in the Discord Developer Portal**,
+    separate from Supabase's own OAuth callback (admin login) and the
+    Interactions Endpoint URL (slash commands). Added to OAuth2 → General →
+    Redirects: `http://localhost:3000/api/discord/callback` and
+    `https://switchboard.mohitraghuwanshi.qzz.io/api/discord/callback`.
+  - **New env var:** `NEXT_PUBLIC_SITE_URL` (e.g. `http://localhost:3000`
+    locally, the production URL on Vercel) — used to build the callback
+    `redirect_uri` dynamically. `DISCORD_APPLICATION_ID` also newly load-bearing
+    here (was captured earlier but not previously used by app code).
+- **An earlier version of this flow was built as a manual form** before the
+  design pivot above — `src/actions/Dashboard/actions.ts` (`connectServer`
+  Server Action) and the original `connect-server-form.tsx` (superseded by
+  `add-server-button.tsx`). These still exist in the repo but are **no longer
+  wired into the dashboard page** — left in place as an unused manual fallback
+  (e.g. useful if a guild's cached name ever needs a manual re-sync), not
+  currently linked from any UI. Safe to delete if unwanted; not required by the
+  current flow.
+- **Bugs hit and fixed during this flow, in order:**
+  1. `client_id=undefined` / `redirect_uri=undefined...` in the Discord
+     authorize URL → `DISCORD_APPLICATION_ID` and `NEXT_PUBLIC_SITE_URL` were
+     either missing from `.env.local` or added after the dev server was already
+     running (Next.js only reads `.env.local` at server startup — fixed by
+     confirming both vars and doing a full dev server restart, not just a hot
+     reload).
+  2. `Invalid OAuth2 redirect_uri` from Discord → env vars were fixed, but the
+     resulting `redirect_uri` value wasn't yet registered in the Discord
+     Developer Portal's OAuth2 Redirects list → fixed by adding both the
+     localhost and production `/api/discord/callback` URLs there.
+  3. **"Bot not found" on every attempt, bot re-addable repeatedly to the same
+     guild** → added logging to the callback route (status + body on guild
+     verification failure) to diagnose. Initially suspected Discord's
+     `integration_require_code_grant` setting (bot doesn't actually join until
+     the backend exchanges the OAuth `code` for a token) — checked, was already
+     off, so ruled out. Logged status turned out to be **`401 Unauthorized`**
+     from Discord's `/guilds/{guild_id}` endpoint — **root cause: the value in
+     `DISCORD_BOT_TOKEN` in `.env.local` already had a `Bot ` prefix baked in**,
+     and the fetch call also prepends `Bot ${token}` when building the
+     `Authorization` header, so the actual header sent was `Bot Bot
+     <token>...` — malformed, rejected by Discord regardless of whether the
+     bot was genuinely in the guild or not. Fixed by correcting the env var to
+     contain only the raw token (no `Bot ` prefix) and restarting the dev
+     server.
+  4. **CONFIRMED WORKING LIVE** after the token fix — full flow clicked
+     through: dashboard → "Add to Discord server" → Discord picker → bot
+     invited → redirected back → verified `admin_guilds` row created in
+     Supabase with correct `user_id`, `guild_id`, and `guild_name` ("JuicyBot").
+     `command_configs` seed rows for `/report` and `/status` expected alongside
+     this (upserted in the same request) — worth a quick manual check in
+     Supabase to confirm both landed, not yet explicitly re-verified.
 
 ## Not started yet
-- **Verifying the login flow live end-to-end (see checklist above) — do this
-  first, before building on top of it**
 - Linking the existing landing page's "Sign in" CTA to `/login`
-- The **"connect a server" flow**: dashboard UI where a logged-in admin provides a
-  Discord Guild ID, the backend verifies the bot is actually present in that guild
-  (e.g. `GET /guilds/{guild_id}` with the bot token — a 404 means the bot isn't
-  there), and only then inserts a row into `admin_guilds`. Without this
-  verification step, an admin could claim ownership of a guild the bot was never
-  added to. This is also where `default_mirror_channel_id` would get set, and
-  where `command_configs` rows would get seeded server-side (secret key) for
-  `/report` and `/status` with sensible defaults.
+- Setting `default_mirror_channel_id` on `admin_guilds` — no UI for this yet;
+  currently every connected guild has `null` here, so mirror posting has no
+  fallback target until either this gets a dashboard control or
+  `command_configs.mirror_channel_id` is set per-command
 - Wiring the actual dedup + write logic into `/api/interactions` (replacing the
   current echo placeholder) — writes must include `guild_id` from the interaction
   payload now that it's `not null`
@@ -258,6 +362,13 @@ auth work, not otherwise detailed here). Not yet linked to `/login`.
   logic alone.
 - Never expose bot token, Discord public key, or Supabase secret key client-side
   or in logs.
+- `DISCORD_BOT_TOKEN` in `.env.local` must be the RAW token only — no `Bot `
+  prefix baked into the env var itself. Any code building the Authorization
+  header does `` `Bot ${token}` `` at call time; a pre-prefixed env var produces
+  `Bot Bot <token>` and a silent `401` from Discord that looks like a
+  guild-membership problem, not a token-format problem. Hit this once already
+  in the "connect a server" flow — will bite again in the mirror-channel
+  posting logic (also not yet built) if not remembered.
 - Supabase's publishable key is safe client-side (respects RLS); the secret key is
   server-only and bypasses RLS — treat it like the old service_role key. The
   dashboard-facing server client (`src/lib/supabase/server.ts`) uses the
@@ -275,7 +386,8 @@ auth work, not otherwise detailed here). Not yet linked to `/login`.
 ## Env vars in play so far
 ```
 # Discord
-DISCORD_APPLICATION_ID=
+DISCORD_APPLICATION_ID=       # now load-bearing: used to build the bot-install
+                               # OAuth2 URL on the dashboard, not just captured
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_PUBLIC_KEY=
@@ -284,11 +396,22 @@ DISCORD_PUBLIC_KEY=
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
 SUPABASE_SECRET_KEY=            # server-only, never NEXT_PUBLIC_, never committed
+
+# App
+NEXT_PUBLIC_SITE_URL=           # e.g. http://localhost:3000 locally,
+                                 # https://switchboard.mohitraghuwanshi.qzz.io in
+                                 # prod -- used to build the Discord bot-install
+                                 # callback redirect_uri dynamically
 ```
 No `SLACK_WEBHOOK_URL` — mirror target is a second Discord channel, uses the
 existing `DISCORD_BOT_TOKEN`. None of these should ever be committed. `.gitignore`
 should include `.env*.local`. No `DATABASE_URL`/`DIRECT_URL`/connection-string env
 vars needed since Prisma was dropped.
+
+**Reminder:** Next.js only reads `.env.local` at server startup — adding or
+changing a var requires a full dev server restart (`Ctrl+C` then `npm run dev`
+again), not just a save-triggered hot reload. This caused a debugging detour
+during the "connect a server" work above.
 
 ## How to resume
 Paste this file into a new chat and say something like: "Continuing the Switchboard
