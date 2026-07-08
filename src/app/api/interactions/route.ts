@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyKey } from 'discord-interactions';
+import { createServerSupabaseClient } from '@/lib/supabase/supabase-server';
 
 const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY!;
 
-// Discord interaction type constants
 const InteractionType = {
     PING: 1,
     APPLICATION_COMMAND: 2,
@@ -18,7 +18,6 @@ const InteractionResponseType = {
 } as const;
 
 export async function POST(req: NextRequest) {
-    // 1. Read the RAW body — signature verification fails if you parse JSON first.
     const rawBody = await req.text();
 
     const signature = req.headers.get('x-signature-ed25519');
@@ -28,37 +27,76 @@ export async function POST(req: NextRequest) {
         return new NextResponse('Missing signature headers', { status: 401 });
     }
 
-    // 2. Verify the Ed25519 signature against the raw body.
     const isValidRequest = await verifyKey(rawBody, signature, timestamp, PUBLIC_KEY);
 
     if (!isValidRequest) {
         return new NextResponse('Bad request signature', { status: 401 });
     }
 
-    // 3. Only parse the JSON *after* verification succeeds.
     const body = JSON.parse(rawBody);
 
-    // 4. Discord sends a PING when you save the endpoint URL — must reply with PONG.
     if (body.type === InteractionType.PING) {
         return NextResponse.json({ type: InteractionResponseType.PONG });
     }
 
-    // 5. Slash command handling goes here (next step).
     if (body.type === InteractionType.APPLICATION_COMMAND) {
-        // Placeholder for now — just echo back that we received it.
+        const supabase = createServerSupabaseClient();
+
+        const discordInteractionId: string = body.id;
+        const guildId: string = body.guild_id;
+        const channelId: string | undefined = body.channel_id;
+        const userId: string | undefined = body.member?.user?.id ?? body.user?.id;
+        const commandName: string = body.data?.name;
+        const commandOptions = body.data?.options ?? null;
+
+        // Dedup: try to insert. If discord_interaction_id already exists, the
+        // unique constraint causes a conflict -- we detect that and skip all
+        // further processing instead of acting on the same interaction twice.
+        const { data: inserted, error } = await supabase
+            .from('interactions')
+            .insert({
+                discord_interaction_id: discordInteractionId,
+                guild_id: guildId,
+                channel_id: channelId,
+                user_id: userId,
+                command_name: commandName,
+                command_options: commandOptions,
+                status: 'received',
+            })
+            .select()
+            .single();
+
+        if (error) {
+            // Postgres unique_violation error code is 23505.
+            if (error.code === '23505') {
+                // Already processed this exact interaction before (Discord redelivery).
+                // Return a normal-looking response without re-running any side effects.
+                return NextResponse.json({
+                    type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                    data: { content: `Already handled: /${commandName}` },
+                });
+            }
+
+            // Any other DB error -- log it server-side, don't leak details to Discord.
+            console.error('Failed to record interaction:', error);
+            return NextResponse.json({
+                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+                data: { content: 'Something went wrong recording that command.' },
+            });
+        }
+
+        // At this point the interaction is durably recorded and deduped.
+        // Real command logic (rule application, Slack mirror, etc.) goes here next --
+        // for now, just confirm receipt.
         return NextResponse.json({
             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: {
-                content: `Received command: /${body.data?.name}`,
-            },
+            data: { content: `Recorded /${commandName} (id: ${inserted.id})` },
         });
     }
 
-    // Fallback for interaction types we don't handle yet (buttons, modals).
     return new NextResponse('Unhandled interaction type', { status: 400 });
 }
 
-// Discord only ever POSTs to this endpoint — reject other methods explicitly.
 export async function GET() {
     return new NextResponse('Method not allowed', { status: 405 });
 }

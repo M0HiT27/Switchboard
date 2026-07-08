@@ -7,6 +7,7 @@
 
 import { motion } from "motion/react";
 import { ArrowRight } from "lucide-react";
+import Link from "next/link";
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -48,10 +49,10 @@ export function Hero() {
       </motion.p>
 
       <motion.div variants={itemVariants} className="flex flex-col sm:flex-row items-center justify-center gap-4">
-        <button className="w-full sm:w-auto px-8 py-4 rounded-full bg-white text-black font-semibold hover:bg-gray-100 transition-colors flex items-center justify-center gap-2">
+        <Link href={"/dashboard"} className="w-full sm:w-auto px-8 py-4 rounded-full bg-white text-black font-semibold hover:bg-gray-100 transition-colors flex items-center justify-center gap-2">
           Connect Discord Server
           <ArrowRight className="w-4 h-4" />
-        </button>
+        </Link>
         <button className="w-full sm:w-auto px-8 py-4 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 font-medium transition-colors">
           View Documentation
         </button>

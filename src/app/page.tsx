@@ -7,6 +7,7 @@ import { Terminal, ExternalLink } from "lucide-react";
 import { Hero } from "@/ui/components/Homepage/hero";
 import { FeaturesGrid } from "@/ui/components/Homepage/features-grid";
 import { DashboardPreview } from "@/ui/components/Homepage/dashboard-preview";
+import Link from "next/link";
 
 export default function Page() {
   return (
@@ -29,9 +30,9 @@ export default function Page() {
             <a href="https://github.com" target="_blank" rel="noreferrer" className="text-gray-400 hover:text-white transition-colors">
               <ExternalLink className="w-5 h-5" />
             </a>
-            <button className="text-sm font-medium px-4 py-2 rounded-full bg-white/10 hover:bg-white/15 transition-colors">
+            <Link href={"/dashboard"} className="text-sm font-medium px-4 py-2 rounded-full bg-white/10 hover:bg-white/15 transition-colors">
               Admin Login
-            </button>
+            </Link>
           </div>
         </div>
       </nav>
