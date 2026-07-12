@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { after } from 'next/server';
 import { verifyKey } from 'discord-interactions';
 import { createServerSupabaseClient } from '@/lib/supabase/supabase-server';
 import { applyRule, type CommandRule } from '@/lib/rules';
+import { sendDiscordMessage, editOriginalInteractionResponse } from '@/lib/Discord/discord';
 
 const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY!;
 
@@ -41,87 +43,131 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.type === InteractionType.APPLICATION_COMMAND) {
-        const supabase = createServerSupabaseClient();
-
         const discordInteractionId: string = body.id;
+        const interactionToken: string = body.token;
         const guildId: string = body.guild_id;
         const channelId: string | undefined = body.channel_id;
         const userId: string | undefined = body.member?.user?.id ?? body.user?.id;
         const commandName: string = body.data?.name;
         const commandOptions = body.data?.options ?? null;
 
-        // Pull the free-text option if this command has one (e.g. /report's `text`).
         const textOption = commandOptions?.find(
             (opt: { name: string; value: string }) => opt.name === 'text'
         )?.value as string | undefined;
 
-        // NEW: look up this guild's config for this specific command. Not
-        // finding one is fine -- defaults apply (command enabled, generic tag/reply).
-        const { data: config } = await supabase
-            .from('command_configs')
-            .select('enabled, rule')
-            .eq('guild_id', guildId)
-            .eq('command_name', commandName)
-            .maybeSingle();
+        // All real work -- config lookup, rule application, the insert, and the
+        // mirror -- now happens AFTER we've already told Discord "I'm thinking".
+        // This is what respects the 3-second window regardless of how slow
+        // Supabase, the mirror send, or (later) an AI call turns out to be.
+        after(async () => {
+            const supabase = createServerSupabaseClient();
 
-        const isEnabled = config?.enabled ?? true;
+            try {
+                const { data: config } = await supabase
+                    .from('command_configs')
+                    .select('enabled, rule, mirror_channel_id')
+                    .eq('guild_id', guildId)
+                    .eq('command_name', commandName)
+                    .maybeSingle();
 
-        let status: string;
-        let replyContent: string;
+                const isEnabled = config?.enabled ?? true;
 
-        if (!isEnabled) {
-            status = 'skipped';
-            replyContent = 'This command is currently disabled by the server admin.';
-        } else {
-            const { tag, reply } = applyRule(config?.rule as CommandRule | null, textOption);
-            status = tag;
-            replyContent = reply;
-        }
+                let status: string;
+                let replyContent: string;
 
-        // Dedup: try to insert. If discord_interaction_id already exists, the
-        // unique constraint causes a conflict -- we detect that and skip all
-        // further processing instead of acting on the same interaction twice.
-        const { data: inserted, error } = await supabase
-            .from('interactions')
-            .insert({
-                discord_interaction_id: discordInteractionId,
-                guild_id: guildId,
-                channel_id: channelId,
-                user_id: userId,
-                command_name: commandName,
-                command_options: commandOptions,
-                status, // CHANGED: was hardcoded 'received', now the rule's tag or 'skipped'
-                response_sent: true,
-            })
-            .select()
-            .single();
+                if (!isEnabled) {
+                    status = 'skipped';
+                    replyContent = 'This command is currently disabled by the server admin.';
+                } else {
+                    const { tag, reply } = applyRule(config?.rule as CommandRule | null, textOption);
+                    status = tag;
+                    replyContent = reply;
+                }
 
-        if (error) {
-            // Postgres unique_violation error code is 23505.
-            if (error.code === '23505') {
-                // Already processed this exact interaction before (Discord redelivery).
-                // Return a normal-looking response without re-running any side effects.
-                return NextResponse.json({
-                    type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-                    data: { content: `Already handled: /${commandName}` },
-                });
+                const { data: inserted, error } = await supabase
+                    .from('interactions')
+                    .insert({
+                        discord_interaction_id: discordInteractionId,
+                        guild_id: guildId,
+                        channel_id: channelId,
+                        user_id: userId,
+                        command_name: commandName,
+                        command_options: commandOptions,
+                        status,
+                        response_sent: true,
+                    })
+                    .select()
+                    .single();
+
+                if (error) {
+                    if (error.code === '23505') {
+                        // Duplicate delivery of an interaction we already fully
+                        // processed (including its original edit). Nothing left to do --
+                        // editing @original again would just be redundant, and we don't
+                        // have the tag/reply from the first pass to redo it meaningfully.
+                        return;
+                    }
+
+                    console.error('Failed to record interaction:', error);
+                    await editOriginalInteractionResponse(
+                        interactionToken,
+                        'Something went wrong recording that command.'
+                    );
+                    return;
+                }
+
+                // Edit the deferred "thinking..." placeholder with the real reply.
+                await editOriginalInteractionResponse(interactionToken, replyContent);
+
+                // Resolve mirror target: per-command override wins, else guild default.
+                let mirrorChannelId: string | null = config?.mirror_channel_id ?? null;
+
+                if (!mirrorChannelId) {
+                    const { data: guildRow } = await supabase
+                        .from('admin_guilds')
+                        .select('default_mirror_channel_id')
+                        .eq('guild_id', guildId)
+                        .limit(1)
+                        .maybeSingle();
+                    mirrorChannelId = guildRow?.default_mirror_channel_id ?? null;
+                }
+
+                if (mirrorChannelId && mirrorChannelId !== channelId) {
+                    try {
+                        const mirrorText = [
+                            `**/${commandName}** used in <#${channelId}> by <@${userId}>`,
+                            textOption ? `> ${textOption}` : null,
+                            `Tag: \`${status}\``,
+                        ]
+                            .filter(Boolean)
+                            .join('\n');
+
+                        await sendDiscordMessage(mirrorChannelId, mirrorText);
+                        await supabase.from('interactions').update({ mirrored: true }).eq('id', inserted.id);
+                    } catch (err) {
+                        // Mirror failing shouldn't affect the reply the user already got.
+                        console.error('Mirror send failed:', err);
+                    }
+                }
+            } catch (err) {
+                // Catch-all so a thrown error inside after() doesn't just vanish into
+                // an unhandled rejection with no trace of what happened to this interaction.
+                console.error('Unhandled error processing interaction:', err);
+                try {
+                    await editOriginalInteractionResponse(
+                        interactionToken,
+                        'Something went wrong processing that command.'
+                    );
+                } catch {
+                    // Original response edit also failed -- nothing more we can do here.
+                }
             }
+        });
 
-            // Any other DB error -- log it server-side, don't leak details to Discord.
-            console.error('Failed to record interaction:', error);
-            return NextResponse.json({
-                type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-                data: { content: 'Something went wrong recording that command.' },
-            });
-        }
-
-        // Slack mirror call goes here next (not yet implemented).
-
-        // CHANGED: was `Recorded /${commandName} (id: ${inserted.id})`,
-        // now uses the rule-generated reply so config actually has an effect.
+        // Sent within milliseconds, well inside the 3-second window, regardless
+        // of how long the after() block above ends up taking.
         return NextResponse.json({
-            type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-            data: { content: replyContent },
+            type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
         });
     }
 

@@ -6,24 +6,25 @@ import Link from 'next/link';
 import { createAuthBrowserClient } from '@/lib/supabase/supabase-auth-browser';
 import type { KeywordTag } from '@/lib/rules';
 import { motion } from 'motion/react';
-import { Terminal, Save, Settings, Plus, X, Server, ArrowLeft, LogOut } from 'lucide-react';
+import { Terminal, Save, Settings, Plus, X, Server, ArrowLeft, LogOut, Radio, ShieldCheck, ShieldAlert } from 'lucide-react';
 import type { User } from '@supabase/supabase-js';
 
 interface AdminGuild {
   guild_id: string;
   guild_name: string | null;
+  default_mirror_channel_id: string | null;
 }
 
 interface CommandConfigRow {
   command_name: string;
   enabled: boolean;
+  mirror_channel_id: string | null;
   rule: {
     keywordTags?: KeywordTag[];
     defaultTag?: string;
     replyTemplate?: string;
   } | null;
 }
-
 const KNOWN_COMMANDS = ['report', 'status'];
 
 export default function CommandConfigClient() {
@@ -38,6 +39,11 @@ export default function CommandConfigClient() {
   const [configs, setConfigs] = useState<Record<string, CommandConfigRow>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState<string | null>(null);
+  const [mirrorErrors, setMirrorErrors] = useState<Record<string, string>>({}); // keyed by command name
+
+  const [guildDefaultMirror, setGuildDefaultMirror] = useState<string>('');
+  const [savingGuildDefault, setSavingGuildDefault] = useState(false);
+  const [guildDefaultError, setGuildDefaultError] = useState<string | null>(null);
 
   useEffect(() => {
     async function loadData() {
@@ -50,7 +56,9 @@ export default function CommandConfigClient() {
       }
       setUser(user);
 
-      const { data } = await supabase.from('admin_guilds').select('guild_id, guild_name');
+      const { data } = await supabase
+        .from('admin_guilds')
+        .select('guild_id, guild_name, default_mirror_channel_id');
 
       if (data && data.length > 0) {
         setGuilds(data);
@@ -68,11 +76,19 @@ export default function CommandConfigClient() {
 
   useEffect(() => {
     if (!selectedGuild) return;
+    const guild = guilds.find((g) => g.guild_id === selectedGuild);
+    setGuildDefaultMirror(guild?.default_mirror_channel_id ?? '');
+    setGuildDefaultError(null);
+    setMirrorErrors({});
+  }, [selectedGuild, guilds]);
+
+  useEffect(() => {
+    if (!selectedGuild) return;
 
     async function loadConfigs() {
       const { data } = await supabase
         .from('command_configs')
-        .select('command_name, enabled, rule')
+        .select('command_name, enabled, rule, mirror_channel_id')
         .eq('guild_id', selectedGuild);
 
       const byCommand: Record<string, CommandConfigRow> = {};
@@ -81,6 +97,7 @@ export default function CommandConfigClient() {
         byCommand[name] = existing ?? {
           command_name: name,
           enabled: true,
+          mirror_channel_id: null,
           rule: { keywordTags: [], defaultTag: 'general', replyTemplate: 'Got it! Tagged as: {tag}' },
         };
       }
@@ -95,6 +112,14 @@ export default function CommandConfigClient() {
       ...prev,
       [commandName]: { ...prev[commandName], ...updates },
     }));
+    // Clear any stale verification error as soon as the user edits the value again.
+    if ('mirror_channel_id' in updates) {
+      setMirrorErrors((prev) => {
+        const next = { ...prev };
+        delete next[commandName];
+        return next;
+      });
+    }
   }
 
   function updateRule(commandName: string, ruleUpdates: Partial<NonNullable<CommandConfigRow['rule']>>) {
@@ -124,9 +149,11 @@ export default function CommandConfigClient() {
   }
 
   async function saveConfig(commandName: string) {
-    setSaving(commandName);
     const config = configs[commandName];
+    setSaving(commandName);
 
+    // Non-mirror fields still go through the normal RLS-scoped client path --
+    // no cross-entity risk there, RLS already scopes it correctly by guild_id.
     const { error } = await supabase.from('command_configs').upsert(
       {
         guild_id: selectedGuild,
@@ -138,8 +165,76 @@ export default function CommandConfigClient() {
       { onConflict: 'guild_id,command_name' }
     );
 
+    if (error) {
+      console.error('Failed to save config:', error);
+      setSaving(null);
+      return;
+    }
+
+    // mirror_channel_id is no longer writable via the RLS client at all --
+    // the DB column privileges were revoked for the authenticated role, so
+    // this server route is the only path that can set it. It re-verifies
+    // ownership + bot permission itself, server-side, using the secret key
+    // only after both checks pass -- bypassing this fetch call gets you
+    // nowhere, since the direct-to-Supabase write it used to allow no longer
+    // has permission on this column at all.
+    const mirrorRes = await fetch('/api/discord/save-mirror-channel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scope: 'command',
+        guildId: selectedGuild,
+        commandName,
+        channelId: config.mirror_channel_id || null,
+      }),
+    });
+    const mirrorResult = await mirrorRes.json();
+
+    if (!mirrorResult.ok) {
+      setMirrorErrors((prev) => ({ ...prev, [commandName]: mirrorResult.reason ?? 'Save failed.' }));
+    } else {
+      setMirrorErrors((prev) => {
+        const next = { ...prev };
+        delete next[commandName];
+        return next;
+      });
+    }
+
     setSaving(null);
-    if (error) console.error('Failed to save config:', error);
+  }
+
+  async function saveGuildDefault() {
+    if (!user || !selectedGuild) return;
+    setSavingGuildDefault(true);
+
+    // Same reasoning as saveConfig: the RLS client can no longer write
+    // default_mirror_channel_id directly (column privilege revoked), so this
+    // route is the only path -- and it re-checks ownership + bot permission
+    // itself, server-side, before writing with the secret key.
+    const res = await fetch('/api/discord/save-mirror-channel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scope: 'guild',
+        guildId: selectedGuild,
+        channelId: guildDefaultMirror || null,
+      }),
+    });
+    const result = await res.json();
+
+    setSavingGuildDefault(false);
+
+    if (!result.ok) {
+      setGuildDefaultError(result.reason ?? 'Save failed.');
+      return;
+    }
+
+    setGuildDefaultError(null);
+    setGuilds((prev) =>
+      prev.map((g) =>
+        g.guild_id === selectedGuild ? { ...g, default_mirror_channel_id: guildDefaultMirror || null } : g
+      )
+    );
   }
 
   async function handleLogout() {
@@ -246,166 +341,248 @@ export default function CommandConfigClient() {
               </Link>
             </div>
           ) : (
-            <div className="grid gap-6 mt-8">
-              {KNOWN_COMMANDS.map((name, i) => {
-                const config = configs[name];
-                if (!config) return null;
-
-                return (
-                  <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: i * 0.1 }}
-                    key={name}
-                    className={`rounded-2xl border transition-all duration-300 ${
-                      config.enabled ? 'bg-white/[0.02] border-white/10 shadow-lg' : 'bg-transparent border-white/5 opacity-60'
+            <>
+              {/* Guild-level default mirror channel */}
+              <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-6 mt-8">
+                <div className="flex items-center gap-2 mb-1">
+                  <Radio className="w-4 h-4 text-indigo-400" />
+                  <h2 className="text-sm font-semibold text-gray-200">Guild Default Mirror Channel</h2>
+                </div>
+                <p className="text-xs text-gray-500 mb-4">
+                  Used for any command that doesn&apos;t set its own Mirror Channel ID below. Verified against this
+                  server before saving.
+                </p>
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input
+                    type="text"
+                    value={guildDefaultMirror}
+                    onChange={(e) => {
+                      setGuildDefaultMirror(e.target.value);
+                      setGuildDefaultError(null);
+                    }}
+                    placeholder="Discord channel ID"
+                    className={`flex-1 bg-black/40 border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-1 transition-all text-white ${
+                      guildDefaultError
+                        ? 'border-red-500/50 focus:border-red-500 focus:ring-red-500'
+                        : 'border-white/10 focus:border-indigo-500 focus:ring-indigo-500'
+                    }`}
+                  />
+                  <button
+                    onClick={saveGuildDefault}
+                    disabled={savingGuildDefault}
+                    className={`flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all whitespace-nowrap ${
+                      savingGuildDefault
+                        ? 'bg-indigo-500/50 text-white cursor-not-allowed'
+                        : 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
                     }`}
                   >
-                    {/* Header */}
-                    <div className="flex items-center justify-between p-6 border-b border-white/5">
-                      <div className="flex items-center gap-3">
-                        <div
-                          className={`px-3 py-1 rounded-md font-mono text-sm border ${
-                            config.enabled
-                              ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
-                              : 'bg-white/5 text-gray-400 border-white/10'
-                          }`}
-                        >
-                          /{name}
-                        </div>
-                      </div>
-                      <label className="flex items-center gap-3 cursor-pointer group">
-                        <span className="text-sm font-medium text-gray-400 group-hover:text-white transition-colors">
-                          {config.enabled ? 'Enabled' : 'Disabled'}
-                        </span>
-                        <div className="relative">
-                          <input
-                            type="checkbox"
-                            className="sr-only"
-                            checked={config.enabled}
-                            onChange={(e) => updateConfig(name, { enabled: e.target.checked })}
-                          />
-                          <div className={`block w-12 h-6 rounded-full transition-colors ${config.enabled ? 'bg-indigo-500' : 'bg-gray-700'}`}></div>
+                    {savingGuildDefault ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        Verifying...
+                      </>
+                    ) : (
+                      <>
+                        <Save className="w-4 h-4" />
+                        Save Default
+                      </>
+                    )}
+                  </button>
+                </div>
+                {guildDefaultError && (
+                  <p className="text-xs text-red-400 mt-2 flex items-center gap-1.5">
+                    <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                    {guildDefaultError}
+                  </p>
+                )}
+              </div>
+
+              <div className="grid gap-6 mt-6">
+                {KNOWN_COMMANDS.map((name, i) => {
+                  const config = configs[name];
+                  if (!config) return null;
+
+                  return (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: i * 0.1 }}
+                      key={name}
+                      className={`rounded-2xl border transition-all duration-300 ${
+                        config.enabled ? 'bg-white/[0.02] border-white/10 shadow-lg' : 'bg-transparent border-white/5 opacity-60'
+                      }`}
+                    >
+                      {/* Header */}
+                      <div className="flex items-center justify-between p-6 border-b border-white/5">
+                        <div className="flex items-center gap-3">
                           <div
-                            className={`absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${
-                              config.enabled ? 'translate-x-6' : 'translate-x-0'
-                            }`}
-                          ></div>
-                        </div>
-                      </label>
-                    </div>
-
-                    {/* Body */}
-                    {config.enabled && (
-                      <div className="p-6 space-y-6">
-                        <div className="grid sm:grid-cols-2 gap-6">
-                          <div>
-                            <label className="block text-sm font-medium text-gray-300 mb-2">Reply Template</label>
-                            <input
-                              type="text"
-                              value={config.rule?.replyTemplate ?? ''}
-                              onChange={(e) => updateRule(name, { replyTemplate: e.target.value })}
-                              placeholder="Got it! Tagged as: {tag}"
-                              className="w-full bg-black/40 border border-white/10 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all text-white"
-                            />
-                            <p className="text-xs text-gray-500 mt-2">Use {'{tag}'} to insert the matched tag.</p>
-                          </div>
-                          <div>
-                            <label className="block text-sm font-medium text-gray-300 mb-2">Default Tag</label>
-                            <input
-                              type="text"
-                              value={config.rule?.defaultTag ?? ''}
-                              onChange={(e) => updateRule(name, { defaultTag: e.target.value })}
-                              placeholder="general"
-                              className="w-full bg-black/40 border border-white/10 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all text-white"
-                            />
-                            <p className="text-xs text-gray-500 mt-2">Applied if no keywords match.</p>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="flex items-center justify-between mb-3">
-                            <label className="block text-sm font-medium text-gray-300">Keyword Routing Rules</label>
-                            <button
-                              onClick={() => addKeywordTag(name)}
-                              className="text-xs font-medium text-indigo-400 hover:text-indigo-300 flex items-center gap-1 bg-indigo-500/10 px-2 py-1 rounded"
-                            >
-                              <Plus className="w-3 h-3" /> Add Rule
-                            </button>
-                          </div>
-
-                          <div className="space-y-3">
-                            {(config.rule?.keywordTags ?? []).length === 0 ? (
-                              <div className="text-sm text-gray-500 p-4 border border-white/5 rounded-lg border-dashed text-center">
-                                No keyword routing rules set. All requests will use the default tag.
-                              </div>
-                            ) : (
-                              (config.rule?.keywordTags ?? []).map((kt, i) => (
-                                <div key={i} className="flex gap-3 items-start relative group">
-                                  <div className="flex-1 grid grid-cols-2 gap-3 p-3 rounded-lg bg-black/20 border border-white/5 group-hover:border-white/10 transition-colors">
-                                    <div>
-                                      <div className="text-xs text-gray-500 mb-1">If message contains</div>
-                                      <input
-                                        type="text"
-                                        value={kt.keyword}
-                                        onChange={(e) => updateKeywordTag(name, i, 'keyword', e.target.value)}
-                                        placeholder="e.g. bug"
-                                        className="w-full bg-black/40 border border-white/10 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-indigo-500 text-white"
-                                      />
-                                    </div>
-                                    <div>
-                                      <div className="text-xs text-gray-500 mb-1">Route to tag</div>
-                                      <input
-                                        type="text"
-                                        value={kt.tag}
-                                        onChange={(e) => updateKeywordTag(name, i, 'tag', e.target.value)}
-                                        placeholder="e.g. technical"
-                                        className="w-full bg-black/40 border border-white/10 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-indigo-500 text-white"
-                                      />
-                                    </div>
-                                  </div>
-                                  <button
-                                    onClick={() => removeKeywordTag(name, i)}
-                                    className="p-3 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors mt-2"
-                                    aria-label="Remove"
-                                  >
-                                    <X className="w-4 h-4" />
-                                  </button>
-                                </div>
-                              ))
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="pt-4 border-t border-white/5 flex justify-end">
-                          <button
-                            onClick={() => saveConfig(name)}
-                            disabled={saving === name}
-                            className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${
-                              saving === name
-                                ? 'bg-indigo-500/50 text-white cursor-not-allowed'
-                                : 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
+                            className={`px-3 py-1 rounded-md font-mono text-sm border ${
+                              config.enabled
+                                ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
+                                : 'bg-white/5 text-gray-400 border-white/10'
                             }`}
                           >
-                            {saving === name ? (
-                              <>
-                                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                                Saving...
-                              </>
-                            ) : (
-                              <>
-                                <Save className="w-4 h-4" />
-                                Save Configuration
-                              </>
-                            )}
-                          </button>
+                            /{name}
+                          </div>
                         </div>
+                        <label className="flex items-center gap-3 cursor-pointer group">
+                          <span className="text-sm font-medium text-gray-400 group-hover:text-white transition-colors">
+                            {config.enabled ? 'Enabled' : 'Disabled'}
+                          </span>
+                          <div className="relative">
+                            <input
+                              type="checkbox"
+                              className="sr-only"
+                              checked={config.enabled}
+                              onChange={(e) => updateConfig(name, { enabled: e.target.checked })}
+                            />
+                            <div className={`block w-12 h-6 rounded-full transition-colors ${config.enabled ? 'bg-indigo-500' : 'bg-gray-700'}`}></div>
+                            <div
+                              className={`absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${
+                                config.enabled ? 'translate-x-6' : 'translate-x-0'
+                              }`}
+                            ></div>
+                          </div>
+                        </label>
                       </div>
-                    )}
-                  </motion.div>
-                );
-              })}
-            </div>
+
+                      {/* Body */}
+                      {config.enabled && (
+                        <div className="p-6 space-y-6">
+                          <div className="grid sm:grid-cols-3 gap-6">
+                            <div>
+                              <label className="block text-sm font-medium text-gray-300 mb-2">Reply Template</label>
+                              <input
+                                type="text"
+                                value={config.rule?.replyTemplate ?? ''}
+                                onChange={(e) => updateRule(name, { replyTemplate: e.target.value })}
+                                placeholder="Got it! Tagged as: {tag}"
+                                className="w-full bg-black/40 border border-white/10 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all text-white"
+                              />
+                              <p className="text-xs text-gray-500 mt-2">Use {'{tag}'} to insert the matched tag.</p>
+                            </div>
+                            <div>
+                              <label className="block text-sm font-medium text-gray-300 mb-2">Default Tag</label>
+                              <input
+                                type="text"
+                                value={config.rule?.defaultTag ?? ''}
+                                onChange={(e) => updateRule(name, { defaultTag: e.target.value })}
+                                placeholder="general"
+                                className="w-full bg-black/40 border border-white/10 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all text-white"
+                              />
+                              <p className="text-xs text-gray-500 mt-2">Applied if no keywords match.</p>
+                            </div>
+                            <div>
+                              <label className="block text-sm font-medium text-gray-300 mb-2">Mirror Channel ID</label>
+                              <input
+                                type="text"
+                                value={config.mirror_channel_id ?? ''}
+                                onChange={(e) => updateConfig(name, { mirror_channel_id: e.target.value || null })}
+                                placeholder="Uses guild default"
+                                className={`w-full bg-black/40 border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-1 transition-all text-white ${
+                                  mirrorErrors[name]
+                                    ? 'border-red-500/50 focus:border-red-500 focus:ring-red-500'
+                                    : 'border-white/10 focus:border-indigo-500 focus:ring-indigo-500'
+                                }`}
+                              />
+                              {mirrorErrors[name] ? (
+                                <p className="text-xs text-red-400 mt-2 flex items-center gap-1.5">
+                                  <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                                  {mirrorErrors[name]}
+                                </p>
+                              ) : (
+                                <p className="text-xs text-gray-500 mt-2 flex items-center gap-1.5">
+                                  <ShieldCheck className="w-3.5 h-3.5 shrink-0 text-gray-600" />
+                                  Overrides the guild default. Checked on save.
+                                </p>
+                              )}
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="flex items-center justify-between mb-3">
+                              <label className="block text-sm font-medium text-gray-300">Keyword Routing Rules</label>
+                              <button
+                                onClick={() => addKeywordTag(name)}
+                                className="text-xs font-medium text-indigo-400 hover:text-indigo-300 flex items-center gap-1 bg-indigo-500/10 px-2 py-1 rounded"
+                              >
+                                <Plus className="w-3 h-3" /> Add Rule
+                              </button>
+                            </div>
+
+                            <div className="space-y-3">
+                              {(config.rule?.keywordTags ?? []).length === 0 ? (
+                                <div className="text-sm text-gray-500 p-4 border border-white/5 rounded-lg border-dashed text-center">
+                                  No keyword routing rules set. All requests will use the default tag.
+                                </div>
+                              ) : (
+                                (config.rule?.keywordTags ?? []).map((kt, i) => (
+                                  <div key={i} className="flex gap-3 items-start relative group">
+                                    <div className="flex-1 grid grid-cols-2 gap-3 p-3 rounded-lg bg-black/20 border border-white/5 group-hover:border-white/10 transition-colors">
+                                      <div>
+                                        <div className="text-xs text-gray-500 mb-1">If message contains</div>
+                                        <input
+                                          type="text"
+                                          value={kt.keyword}
+                                          onChange={(e) => updateKeywordTag(name, i, 'keyword', e.target.value)}
+                                          placeholder="e.g. bug"
+                                          className="w-full bg-black/40 border border-white/10 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-indigo-500 text-white"
+                                        />
+                                      </div>
+                                      <div>
+                                        <div className="text-xs text-gray-500 mb-1">Route to tag</div>
+                                        <input
+                                          type="text"
+                                          value={kt.tag}
+                                          onChange={(e) => updateKeywordTag(name, i, 'tag', e.target.value)}
+                                          placeholder="e.g. technical"
+                                          className="w-full bg-black/40 border border-white/10 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-indigo-500 text-white"
+                                        />
+                                      </div>
+                                    </div>
+                                    <button
+                                      onClick={() => removeKeywordTag(name, i)}
+                                      className="p-3 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors mt-2"
+                                      aria-label="Remove"
+                                    >
+                                      <X className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="pt-4 border-t border-white/5 flex justify-end">
+                            <button
+                              onClick={() => saveConfig(name)}
+                              disabled={saving === name}
+                              className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${
+                                saving === name
+                                  ? 'bg-indigo-500/50 text-white cursor-not-allowed'
+                                  : 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
+                              }`}
+                            >
+                              {saving === name ? (
+                                <>
+                                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                  Verifying...
+                                </>
+                              ) : (
+                                <>
+                                  <Save className="w-4 h-4" />
+                                  Save Configuration
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </motion.div>
+                  );
+                })}
+              </div>
+            </>
           )}
         </motion.div>
       </main>
