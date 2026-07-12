@@ -36,9 +36,12 @@ Deadline: 72 hours from start (check original message timestamp for exact cutoff
   `/webhooks/{app_id}/{token}/messages/@original` — **DONE**. See "Deferred
   response + mirror" below.
 - **Hosting:** Vercel (free tier)
-- **AI stretch goal (optional, in progress):** Groq free tier, `llama-3.1-8b-instant`.
-  Config-UI toggle (`rule.aiTriage`) is wired; backend (`src/lib/ai.ts`, route
-  wiring, `ai_summary` schema column) not yet applied — see "Not started yet".
+- **AI stretch goal — DONE, confirmed working:** Groq free tier,
+  `llama-3.1-8b-instant`. Config-UI toggle (`rule.aiTriage`) plus the
+  backend (schema column, Groq call, route wiring) are live — the log page
+  shows real AI-generated summaries via the `Sparkles` hover indicator, not
+  just the rule-based tag. Exact backend code not yet re-synced into this
+  file — see "Not started yet" caveat.
 
 ## Project name
 **Switchboard**. Live at: `https://switchboard.mohitraghuwanshi.qzz.io/`
@@ -229,9 +232,10 @@ established as insufficient on its own.
   just another key in the same object already being upserted. UI is a
   `Sparkles`-icon toggle switch placed after the keyword routing rules and
   before the save button, styled to match the existing enabled/disabled
-  switch. **Frontend-only so far** — this toggle has no effect yet until the
-  backend pieces below (`src/lib/ai.ts`, `interactions` route wiring,
-  `ai_summary` column) are actually applied.
+  switch. **Confirmed live** — hovering the `Sparkles` icon on the log page
+  now shows a real AI-generated summary, so the backend (schema, `ai.ts`,
+  route wiring) is in place even though its exact code hasn't been re-synced
+  into this context file yet.
 
 ### Database — schema + privileges updated this session
 `schema.sql`: same three tables (`admin_guilds`, `interactions`,
@@ -273,12 +277,11 @@ component reads `useSearchParams()`) + `CommandLogClient.tsx`:
   value from one server's rules doesn't silently hide everything after
   switching to another. "Showing X of Y loaded" counter + a clear-filters
   button.
-- **`ai_summary` display, ready ahead of the backend:** the `InteractionRow`
-  type and Tag column already account for a future `ai_summary` column — a
-  small `Sparkles` icon renders next to the tag badge whenever
-  `row.ai_summary` is present, with the full summary shown on hover.
-  Currently inert in practice since no row has `ai_summary` populated yet
-  (backend not wired — see "Not started yet").
+- **`ai_summary` display — DONE, confirmed populated:** the `InteractionRow`
+  type and Tag column render a small `Sparkles` icon next to the tag badge
+  whenever `row.ai_summary` is present, with the full summary shown on
+  hover. Confirmed showing real AI-generated text on triaged rows, not just
+  the rule-based tag.
 - **TS fix hit while wiring the above:** lucide-react's icon prop types don't
   include `title`, so `<Sparkles title={row.ai_summary} />` failed to
   compile (`Property 'title' does not exist on type ... LucideProps`). Fixed
@@ -354,18 +357,19 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
 - ~~README.md, .env.example~~ — **DONE**
 - ~~AI_NOTES.md~~ — **DONE** (mirror-security-hardening entry,
   GRANT/upsert-conflict-key entry, improvements section filled in)
-- **AI triage stretch goal — backend still to apply** (frontend toggle and
-  log-page display are done, see above):
-  - `schema.sql`: `alter table interactions add column if not exists ai_summary text;`
-  - `src/lib/ai.ts` — new file, Groq-based `triageReportText()` helper
-  - Wire into the interactions route's `after()` block, replacing/augmenting
-    the existing `applyRule()` tag block; add `ai_summary: aiSummary` to the
-    `interactions` insert
-  - `GROQ_API_KEY` env var — add to `.env.local` and Vercel
-  - Open design question carried over from planning: AI tag currently meant
-    to override the rule-based tag when triage succeeds — confirm that's
-    still the wanted behavior vs. keeping the rule tag and only adding the
-    summary
+- ~~**AI triage stretch goal — backend**~~ — **DONE, confirmed working.**
+  Log page shows a `Sparkles` icon next to the tag on triaged rows, and
+  hovering reveals an actual AI-generated summary (not just the rule-based
+  tag) — confirmed live, not just wired. The planned pieces (schema column,
+  `src/lib/ai.ts`, `after()`-block wiring, `GROQ_API_KEY`) are therefore
+  live in some form.
+  **Caveat:** the exact final code for these pieces was applied outside this
+  chat session and hasn't been pasted back in, so this file can't yet
+  capture the precise implementation (e.g. whether the AI tag overrides the
+  rule tag or sits alongside it, exact fallback behavior, exact `ai.ts`
+  contents). If you want full fidelity here for a fresh-session resume,
+  paste `schema.sql`, `src/lib/ai.ts`, and the updated `interactions/route.ts`
+  and this file will be updated with real specifics in place of this note.
 - Remaining stretch goals beyond AI triage (buttons, modals, observability)
 - Optional: live re-check of admin's current Discord Administrator status
   (vs. relying solely on the `admin_guilds` row from connect-time)
