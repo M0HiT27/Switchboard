@@ -1,8 +1,3 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
 import { Terminal, ExternalLink } from "lucide-react";
 import { Hero } from "@/ui/components/Homepage/hero";
 import { FeaturesGrid } from "@/ui/components/Homepage/features-grid";

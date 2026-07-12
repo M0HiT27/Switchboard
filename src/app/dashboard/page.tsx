@@ -1,8 +1,9 @@
 import { createAuthServerClient } from '@/lib/supabase/supabase-auth-server'
 import { redirect } from 'next/navigation'
+import Link from 'next/link'
 import { AddServerButton } from '@/ui/components/Dashboard/add-server-button'
 import { MotionDiv } from '@/ui/components/Dashboard/motion-div' // thin client wrapper, see note below
-import { Terminal, LogOut, Server } from 'lucide-react'
+import { Terminal, Server, Settings } from 'lucide-react'
 import { SignOutButton } from '@/ui/components/Dashboard/sign-out-button'
 
 export default async function DashboardPage() {
@@ -51,6 +52,13 @@ export default async function DashboardPage() {
             <span className="font-bold text-lg tracking-tight">Switchboard Admin</span>
           </div>
           <div className="flex items-center gap-4">
+            <Link
+              href="/dashboard/config"
+              className="text-sm font-medium px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 transition-colors flex items-center gap-2"
+            >
+              <Settings className="w-4 h-4" />
+              Command Rules
+            </Link>
             <div className="hidden sm:flex items-center gap-2 text-sm text-gray-400 mr-4">
               <span className="w-2 h-2 rounded-full bg-green-500" />
               {user.user_metadata?.full_name ?? user.email}
@@ -95,7 +103,16 @@ export default async function DashboardPage() {
                       <div className="font-medium text-lg">{g.guild_name ?? g.guild_id}</div>
                       <div className="text-sm text-gray-500 mt-1 font-mono">ID: {g.guild_id}</div>
                     </div>
-                    <div className="w-2 h-2 rounded-full bg-green-500/80 shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
+                    <div className="flex items-center gap-3">
+                      <Link
+                        href={`/dashboard/config?guild=${g.guild_id}`}
+                        className="text-sm font-medium px-3 py-1.5 rounded-md bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors flex items-center gap-1.5"
+                      >
+                        <Settings className="w-3.5 h-3.5" />
+                        Configure
+                      </Link>
+                      <div className="w-2 h-2 rounded-full bg-green-500/80 shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
+                    </div>
                   </MotionDiv>
                 ))}
               </div>
