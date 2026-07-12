@@ -95,7 +95,7 @@ export async function POST(req: NextRequest) {
                     // considers the interaction acknowledged -- that already
                     // happened milliseconds ago via the deferred response.
                     const aiEnabled = (rule as (CommandRule & { aiTriage?: boolean }) | null)?.aiTriage === true;
-
+                    console.log('aiEnabled', aiEnabled, textOption);
                     if (aiEnabled && textOption) {
                         try {
                             const triage = await triageReportText(textOption);
