@@ -40,7 +40,9 @@ create table if not exists interactions (
   status text not null default 'received', -- received | processed | failed
   response_sent boolean not null default false,
   mirrored boolean not null default false,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  ai_summary text -- optional AI-generated triage summary (populated when
+                   -- rule.aiTriage is enabled and Groq returns a result)
 );
 
 -- Lets the admin configure per-command behavior instead of hard-coding it.
@@ -72,6 +74,16 @@ create policy "Users can read their own guild connections"
 create policy "Users can insert their own guild connections"
   on admin_guilds for insert
   to authenticated
+  with check (user_id = auth.uid());
+
+-- NEW: lets an admin update their own guild connection row -- specifically
+-- needed for the config page's "Guild Default Mirror Channel" save action
+-- (writes default_mirror_channel_id). Without this, that update silently
+-- affects 0 rows under RLS instead of erroring, which is easy to miss.
+create policy "Users can update their own guild connections"
+  on admin_guilds for update
+  to authenticated
+  using (user_id = auth.uid())
   with check (user_id = auth.uid());
 
 create policy "Users can delete their own guild connections"
@@ -129,3 +141,14 @@ create policy "Users can insert command configs for their connected guilds"
 -- to new rows as they're inserted. Realtime respects RLS on the subscribing
 -- user's session, so the guild-scoping above applies automatically here too.
 alter publication supabase_realtime add table interactions;
+
+revoke update on command_configs from authenticated;
+grant update (guild_id, command_name, enabled, rule, updated_at) on command_configs to authenticated;
+-- NOTE: guild_id and command_name must be included even though they're the
+-- upsert conflict keys and their values don't change -- PostgREST's generated
+-- ON CONFLICT DO UPDATE SET clause reassigns them, and Postgres checks
+-- column-level UPDATE privilege against anything in SET.
+
+-- ...and admin_guilds too, if you want to fully lock down default_mirror_channel_id
+revoke update on admin_guilds from authenticated;
+grant update (guild_name) on admin_guilds to authenticated;
