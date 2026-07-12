@@ -13,58 +13,10 @@ import { NextResponse } from 'next/server'
 // test guild), update this array to match exactly before relying on it --
 // mismatched options here would silently register a different command
 // shape than what your route code expects.
-const SLASH_COMMANDS = [
-    {
-        name: 'report',
-        description: 'Submit a report',
-        type: 1, // CHAT_INPUT
-        options: [
-            {
-                name: 'text',
-                description: 'Describe the issue',
-                type: 3, // STRING
-                required: true,
-            },
-        ],
-    },
-    {
-        name: 'status',
-        description: 'Check status',
-        type: 1, // CHAT_INPUT
-    },
-]
 
 // Registers /report and /status on a newly-connected guild using the fixed
 // definitions above.
-async function registerGuildCommands(guildId: string): Promise<boolean> {
-    const appId = process.env.DISCORD_APPLICATION_ID
 
-    if (!appId) {
-        console.error('[discord/callback] DISCORD_APPLICATION_ID not set, cannot register commands.')
-        return false
-    }
-
-    const putRes = await fetch(
-        `https://discord.com/api/v10/applications/${appId}/guilds/${guildId}/commands`,
-        {
-            method: 'PUT',
-            headers: {
-                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(SLASH_COMMANDS),
-        }
-    )
-
-    if (!putRes.ok) {
-        console.error(
-            `[discord/callback] Failed to register commands on guild ${guildId}. Status: ${putRes.status}, Body: ${await putRes.text()}`
-        )
-        return false
-    }
-
-    return true
-}
 
 export async function GET(request: Request) {
     const { searchParams, origin } = new URL(request.url)
@@ -146,10 +98,7 @@ export async function GET(request: Request) {
     // connected -- worst case the admin sees "server connected" but the
     // commands don't appear yet, which is at least visible/debuggable via
     // these logs, vs. failing the whole connect flow over it.
-    const commandsRegistered = await registerGuildCommands(guild.id)
-    if (!commandsRegistered) {
-        console.error(`[discord/callback] Command registration failed for guild ${guild.id} -- may need manual registration.`)
-    }
+
 
     console.log(`[discord/callback] Success: connected guild ${guild.id} (${guild.name}) to user ${user.id}`)
 
