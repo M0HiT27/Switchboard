@@ -3,7 +3,7 @@ import { redirect } from 'next/navigation'
 import Link from 'next/link'
 import { AddServerButton } from '@/ui/components/Dashboard/add-server-button'
 import { MotionDiv } from '@/ui/components/Dashboard/motion-div' // thin client wrapper, see note below
-import { Terminal, Server, Settings } from 'lucide-react'
+import { Terminal, Server, Settings, Radio } from 'lucide-react'
 import { SignOutButton } from '@/ui/components/Dashboard/sign-out-button'
 
 export default async function DashboardPage() {
@@ -52,6 +52,13 @@ export default async function DashboardPage() {
             <span className="font-bold text-lg tracking-tight">Switchboard Admin</span>
           </div>
           <div className="flex items-center gap-4">
+            <Link
+              href="/dashboard/logs"
+              className="text-sm font-medium px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 transition-colors flex items-center gap-2"
+            >
+              <Radio className="w-4 h-4" />
+              Command Log
+            </Link>
             <Link
               href="/dashboard/config"
               className="text-sm font-medium px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 transition-colors flex items-center gap-2"
@@ -104,6 +111,13 @@ export default async function DashboardPage() {
                       <div className="text-sm text-gray-500 mt-1 font-mono">ID: {g.guild_id}</div>
                     </div>
                     <div className="flex items-center gap-3">
+                      <Link
+                        href={`/dashboard/logs?guild=${g.guild_id}`}
+                        className="text-sm font-medium px-3 py-1.5 rounded-md bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 transition-colors flex items-center gap-1.5"
+                      >
+                        <Radio className="w-3.5 h-3.5" />
+                        Logs
+                      </Link>
                       <Link
                         href={`/dashboard/config?guild=${g.guild_id}`}
                         className="text-sm font-medium px-3 py-1.5 rounded-md bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors flex items-center gap-1.5"

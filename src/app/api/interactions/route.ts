@@ -4,6 +4,7 @@ import { verifyKey } from 'discord-interactions';
 import { createServerSupabaseClient } from '@/lib/supabase/supabase-server';
 import { applyRule, type CommandRule } from '@/lib/rules';
 import { sendDiscordMessage, editOriginalInteractionResponse } from '@/lib/Discord/discord';
+import { triageReportText } from '@/lib/ai';
 
 const PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY!;
 
@@ -55,10 +56,11 @@ export async function POST(req: NextRequest) {
             (opt: { name: string; value: string }) => opt.name === 'text'
         )?.value as string | undefined;
 
-        // All real work -- config lookup, rule application, the insert, and the
-        // mirror -- now happens AFTER we've already told Discord "I'm thinking".
-        // This is what respects the 3-second window regardless of how slow
-        // Supabase, the mirror send, or (later) an AI call turns out to be.
+        // All real work -- config lookup, rule application, AI triage, the
+        // insert, and the mirror -- now happens AFTER we've already told
+        // Discord "I'm thinking". This is what respects the 3-second window
+        // regardless of how slow Supabase, the mirror send, or the Groq call
+        // turns out to be.
         after(async () => {
             const supabase = createServerSupabaseClient();
 
@@ -74,14 +76,47 @@ export async function POST(req: NextRequest) {
 
                 let status: string;
                 let replyContent: string;
+                let aiSummary: string | null = null;
 
                 if (!isEnabled) {
                     status = 'skipped';
                     replyContent = 'This command is currently disabled by the server admin.';
                 } else {
-                    const { tag, reply } = applyRule(config?.rule as CommandRule | null, textOption);
+                    const rule = config?.rule as CommandRule | null;
+                    const { tag, reply } = applyRule(rule, textOption);
                     status = tag;
                     replyContent = reply;
+
+                    // AI triage -- opt-in per command via rule.aiTriage, and only
+                    // attempted when there's actual free text to triage (e.g.
+                    // /report's `text` option; /status typically won't have one).
+                    // Entirely inside after(), so its latency only affects the
+                    // *content* of the follow-up PATCH, never whether Discord
+                    // considers the interaction acknowledged -- that already
+                    // happened milliseconds ago via the deferred response.
+                    const aiEnabled = (rule as (CommandRule & { aiTriage?: boolean }) | null)?.aiTriage === true;
+
+                    if (aiEnabled && textOption) {
+                        try {
+                            const triage = await triageReportText(textOption);
+                            if (triage) {
+                                aiSummary = triage.summary;
+                                // AI tag overrides the rule-based one when triage
+                                // succeeds -- treated as a more specific
+                                // classification than the keyword-match fallback.
+                                status = triage.tag;
+                                replyContent = `${replyContent}\n\n🤖 ${triage.summary}`;
+                            }
+                            // triage === null (missing key, timeout, bad output):
+                            // silently keep the rule-based tag/reply above --
+                            // graceful degradation, not an error state.
+                        } catch (err) {
+                            // Defensive extra layer -- triageReportText already
+                            // catches internally, but this must never prevent the
+                            // already-good rule-based reply from being sent.
+                            console.error('AI triage threw unexpectedly:', err);
+                        }
+                    }
                 }
 
                 const { data: inserted, error } = await supabase
@@ -95,6 +130,7 @@ export async function POST(req: NextRequest) {
                         command_options: commandOptions,
                         status,
                         response_sent: true,
+                        ai_summary: aiSummary,
                     })
                     .select()
                     .single();
@@ -138,6 +174,7 @@ export async function POST(req: NextRequest) {
                             `**/${commandName}** used in <#${channelId}> by <@${userId}>`,
                             textOption ? `> ${textOption}` : null,
                             `Tag: \`${status}\``,
+                            aiSummary ? `🤖 ${aiSummary}` : null,
                         ]
                             .filter(Boolean)
                             .join('\n');

@@ -36,7 +36,9 @@ Deadline: 72 hours from start (check original message timestamp for exact cutoff
   `/webhooks/{app_id}/{token}/messages/@original` — **DONE**. See "Deferred
   response + mirror" below.
 - **Hosting:** Vercel (free tier)
-- **AI stretch goal (optional, not started):** Groq free tier
+- **AI stretch goal (optional, in progress):** Groq free tier, `llama-3.1-8b-instant`.
+  Config-UI toggle (`rule.aiTriage`) is wired; backend (`src/lib/ai.ts`, route
+  wiring, `ai_summary` schema column) not yet applied — see "Not started yet".
 
 ## Project name
 **Switchboard**. Live at: `https://switchboard.mohitraghuwanshi.qzz.io/`
@@ -179,7 +181,7 @@ route still exists and could be reused as a standalone check separate from
 the write path — currently redundant with `save-mirror-channel`'s own
 verification, decision on whether to keep both or consolidate is open).
 
-### Command config UI — DONE, includes mirror fields + verification feedback
+### Command config UI — DONE, includes mirror fields + verification feedback + AI triage toggle
 `src/app/dashboard/config/page.tsx` (component: `CommandConfigClient.tsx`):
 - Per-command: enabled toggle, reply template, default tag, keyword→tag list,
   Mirror Channel ID field (per-command override)
@@ -191,6 +193,15 @@ verification, decision on whether to keep both or consolidate is open).
 - Non-mirror fields save via the normal RLS-scoped upsert (`enabled`, `rule`,
   `updated_at`, plus `guild_id`/`command_name` as conflict keys); mirror
   fields save via the separate secret-key-backed route
+- **NEW this session — AI Triage toggle:** `rule.aiTriage` (boolean) added to
+  `CommandConfigRow['rule']`. Rides along inside the existing `rule` jsonb
+  column, so no schema change and no `saveConfig()` change were needed — it's
+  just another key in the same object already being upserted. UI is a
+  `Sparkles`-icon toggle switch placed after the keyword routing rules and
+  before the save button, styled to match the existing enabled/disabled
+  switch. **Frontend-only so far** — this toggle has no effect yet until the
+  backend pieces below (`src/lib/ai.ts`, `interactions` route wiring,
+  `ai_summary` column) are actually applied.
 
 ### Database — schema + privileges updated this session
 `schema.sql`: same three tables (`admin_guilds`, `interactions`,
@@ -204,6 +215,72 @@ verification, decision on whether to keep both or consolidate is open).
   alongside `enabled, rule, updated_at` (the upsert/conflict-key gotcha
   above) — if `schema.sql` is reapplied from scratch, don't drop those two
   columns from the grant.
+
+### Live command log page — DONE
+`src/app/dashboard/logs/page.tsx` (wrapped in `Suspense`, needed because the
+component reads `useSearchParams()`) + `command-log-client.tsx`:
+- Same guild-selector pattern as the config page for UX consistency
+- Initial fetch of the most recent 50 `interactions` rows for the selected
+  guild (RLS-scoped, no new server route needed — this is exactly the read
+  path the existing `select` policy already covers), plus a Supabase Realtime
+  subscription (`postgres_changes`, `event: '*'`, filtered to the guild) for
+  live updates. Subscribes to both `INSERT` (new interaction arrives) and
+  `UPDATE` (catches the `mirrored: true` flip that lands a moment later once
+  the `after()` block's mirror send finishes) — so a row visibly updates
+  twice per command in practice.
+- Small "Live"/"Connecting..." indicator driven off the subscription's own
+  status callback, so it's visually obvious the feed is actually live.
+- **Column relabeling for honesty:** the `interactions.status` column is
+  really the rule *tag* `applyRule()` computed (`skipped` if the command was
+  disabled, otherwise the matched/default keyword tag) — not a success/
+  failure signal. UI now labels it "Tag," and a separate "Result" column uses
+  `response_sent` (already existed in the schema) to show real reply
+  success/failure. This was a real point of confusion caught before it
+  shipped confusingly.
+- **Filter bar** — command name, tag, and result (replied/failed/any), all
+  computed client-side over the currently-loaded/streaming window (no extra
+  queries, no RLS changes). Filters auto-reset on guild switch so a filter
+  value from one server's rules doesn't silently hide everything after
+  switching to another. "Showing X of Y loaded" counter + a clear-filters
+  button.
+- **NEW this session — `ai_summary` display, ready ahead of the backend:**
+  the `InteractionRow` type and Tag column already account for a future
+  `ai_summary` column — a small `Sparkles` icon renders next to the tag
+  badge whenever `row.ai_summary` is present, with the full summary shown on
+  hover. Currently inert in practice since no row has `ai_summary` populated
+  yet (backend not wired — see "Not started yet").
+- **TS fix hit while wiring the above:** lucide-react's icon prop types don't
+  include `title`, so `<Sparkles title={row.ai_summary} />` failed to
+  compile (`Property 'title' does not exist on type ... LucideProps`). Fixed
+  by moving the `title` attribute onto a wrapping `<span>` (a plain DOM
+  element, which accepts `title` natively) and rendering `Sparkles` inside
+  it — same hover behavior, no type error. Worth remembering for any other
+  icon-with-tooltip pattern: put `title`/native HTML attributes on a
+  wrapping element, not on the icon component itself.
+- **Known limitation, acceptable for this project's scope:** filtering only
+  operates over the last 50 loaded rows per guild — it's a live-tail view,
+  not a paginated/server-side-filtered historical search. Extending to full
+  history would need a server-side query instead of client-side `.filter()`.
+
+### Cross-tab logout hardening — DONE (found while building the log page)
+**Bug:** if the log page (or, by the same logic, the config page) is open in
+one tab and the admin logs out from a different tab, the original page kept
+working — the Realtime subscription just kept streaming live rows to a
+"logged out" screen until its JWT happened to expire on its own (up to an
+hour). The one-time `getUser()` check in the initial load effect never fires
+again after mount, so nothing in the component learns about a sign-out that
+happened elsewhere.
+**Fix, two layers, both added to `command-log-client.tsx`:**
+1. `supabase.auth.onAuthStateChange()` listener reacting to `SIGNED_OUT` —
+   Supabase's `GoTrueClient` broadcasts auth events across same-origin tabs
+   via `BroadcastChannel`, so a logout in Tab A fires this almost immediately
+   in Tab B, redirecting to `/login`.
+2. A `visibilitychange` listener that re-validates the session directly
+   against Supabase whenever the tab regains visibility — belt-and-suspenders
+   in case the tab was backgrounded/suspended and missed the broadcast.
+**Not yet applied elsewhere:** `CommandConfigClient.tsx` has the identical
+one-time `getUser()` pattern and the same exposure — flagged to receive the
+same two effects, not yet done.
 
 ### Auth + connect-a-server flow — DONE (unchanged since last update)
 Client architecture confirmed correct across login, connect-server, and config
@@ -240,18 +317,34 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
    AI_NOTES.md line even if it's not the "hardest bug."
 
 ## Not started yet
-- Dashboard's live command log page (Realtime subscription on `interactions`,
-  scoped by `admin_guilds` ownership) — natural next step, ties everything
-  together visually
+- Apply the same two cross-tab-logout effects (`onAuthStateChange` +
+  `visibilitychange` revalidation) to `CommandConfigClient.tsx` — same
+  one-time `getUser()` exposure as the log page had before the fix
 - Decide fate of `/api/discord/verify-channel` (standalone reuse as a "test
   channel" button, or remove since `save-mirror-channel` already verifies)
 - README.md, .env.example
-- AI_NOTES.md — needs the mirror-security-hardening entry and the
-  GRANT/upsert-conflict-key entry in addition to the existing candidates
-  (client mismatch, RLS update-policy gap, deferred-response redesign)
-- Remaining stretch goals (buttons, modals, AI triage, observability)
+- AI_NOTES.md — needs the mirror-security-hardening entry, the
+  GRANT/upsert-conflict-key entry, the status/tag-column relabeling +
+  cross-tab-logout entries, and (once backend lands) the AI triage feature,
+  in addition to the existing candidates (client mismatch, RLS update-policy
+  gap, deferred-response redesign)
+- **AI triage stretch goal — backend still to apply** (frontend toggle and
+  log-page display are done, see above):
+  - `schema.sql`: `alter table interactions add column if not exists ai_summary text;`
+  - `src/lib/ai.ts` — new file, Groq-based `triageReportText()` helper
+  - Wire into the interactions route's `after()` block, replacing/augmenting
+    the existing `applyRule()` tag block; add `ai_summary: aiSummary` to the
+    `interactions` insert
+  - `GROQ_API_KEY` env var — add to `.env.local` and Vercel
+  - Open design question carried over from planning: AI tag currently meant
+    to override the rule-based tag when triage succeeds — confirm that's
+    still the wanted behavior vs. keeping the rule tag and only adding the
+    summary
+- Remaining stretch goals beyond AI triage (buttons, modals, observability)
 - Optional: live re-check of admin's current Discord Administrator status
   (vs. relying solely on the `admin_guilds` row from connect-time)
+- Optional: server-side/paginated filtering on the log page if full-history
+  search ever matters more than the live-tail view
 
 ## Key technical notes to remember
 - Signature verification MUST use the raw request body string.
@@ -278,6 +371,19 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
   either app-layer verification with the write funneled through a single
   trusted path, or is otherwise bypassable by anyone with direct REST access
   and a valid session.
+- **A column's name isn't its meaning.** `interactions.status` holds the rule
+  tag `applyRule()` computed, not a success/failure signal — `response_sent`
+  is the real one. Worth double-checking any schema column whose name
+  implies more than what it actually stores before building UI around it.
+- **Supabase auth state doesn't self-propagate across tabs without a
+  listener.** `getUser()` called once on mount only reflects the session at
+  that moment — a logout in another tab won't affect an already-mounted
+  component unless it explicitly subscribes to
+  `supabase.auth.onAuthStateChange()` (which Supabase broadcasts across
+  same-origin tabs via `BroadcastChannel`) and/or re-validates on
+  `visibilitychange`. Any page holding a live subscription (Realtime,
+  polling, etc.) is especially exposed, since it'll keep working silently
+  post-logout until its JWT naturally expires otherwise.
 - **Column-level GRANT/REVOKE + `upsert(..., { onConflict })` gotcha:**
   PostgREST's generated `ON CONFLICT DO UPDATE SET` clause reassigns every
   column present in the payload, including the conflict-target columns
@@ -301,6 +407,11 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
 - `after()` still consumes execution time against Vercel Hobby plan's function
   duration limits — it doesn't make the work free, just non-blocking for
   Discord's response window specifically.
+- **lucide-react icon components don't accept `title` in their prop types**,
+  even though the underlying `<svg>` would render it fine. For an
+  icon-with-native-tooltip pattern, wrap the icon in a plain element (e.g.
+  `<span title="...">`) instead of passing `title` to the icon component
+  directly.
 
 ## Env vars in play
 ```
@@ -326,6 +437,7 @@ Paste this file into a new chat and say something like: "Continuing the
 Switchboard project — here's the context file, let's pick up from [wherever
 you left off]." Also paste `schema.sql`, all four Supabase client files, the
 interactions `route.ts`, `discord.ts`, `rules.ts`, `CommandConfigClient.tsx`,
-`save-mirror-channel/route.ts`, `verify-channel/route.ts`, and `AI_NOTES.md`
-if starting completely fresh, since they carry detail this file only
+`save-mirror-channel/route.ts`, `verify-channel/route.ts`,
+`CommandLogClient.tsx`, `dashboard/logs/page.tsx`, and `AI_NOTES.md` if
+starting completely fresh, since they carry detail this file only
 summarizes.

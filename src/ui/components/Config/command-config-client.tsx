@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { createAuthBrowserClient } from '@/lib/supabase/supabase-auth-browser';
 import type { KeywordTag } from '@/lib/rules';
 import { motion } from 'motion/react';
-import { Terminal, Save, Settings, Plus, X, Server, ArrowLeft, LogOut, Radio, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { Terminal, Save, Settings, Plus, X, Server, ArrowLeft, LogOut, Radio, ShieldCheck, ShieldAlert, Sparkles } from 'lucide-react';
 import type { User } from '@supabase/supabase-js';
 
 interface AdminGuild {
@@ -23,6 +23,7 @@ interface CommandConfigRow {
     keywordTags?: KeywordTag[];
     defaultTag?: string;
     replyTemplate?: string;
+    aiTriage?: boolean;
   } | null;
 }
 const KNOWN_COMMANDS = ['report', 'status'];
@@ -551,6 +552,41 @@ export default function CommandConfigClient() {
                                 ))
                               )}
                             </div>
+                          </div>
+
+                          {/* AI Triage (Groq) toggle */}
+                          <div className="pt-4 border-t border-white/5">
+                            <label className="flex items-center justify-between cursor-pointer group">
+                              <div className="flex items-center gap-2">
+                                <Sparkles className="w-4 h-4 text-indigo-400" />
+                                <div>
+                                  <div className="text-sm font-medium text-gray-200">AI Triage (Groq)</div>
+                                  <p className="text-xs text-gray-500 mt-0.5">
+                                    Summarizes and re-tags the report text using an LLM. Falls back to
+                                    the rule above if the AI call fails or times out. Requires
+                                    GROQ_API_KEY to be set on the server.
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="relative shrink-0 ml-4">
+                                <input
+                                  type="checkbox"
+                                  className="sr-only"
+                                  checked={config.rule?.aiTriage ?? false}
+                                  onChange={(e) => updateRule(name, { aiTriage: e.target.checked })}
+                                />
+                                <div
+                                  className={`block w-12 h-6 rounded-full transition-colors ${
+                                    config.rule?.aiTriage ? 'bg-indigo-500' : 'bg-gray-700'
+                                  }`}
+                                />
+                                <div
+                                  className={`absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${
+                                    config.rule?.aiTriage ? 'translate-x-6' : 'translate-x-0'
+                                  }`}
+                                />
+                              </div>
+                            </label>
                           </div>
 
                           <div className="pt-4 border-t border-white/5 flex justify-end">
