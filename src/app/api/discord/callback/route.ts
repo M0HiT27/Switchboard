@@ -20,7 +20,7 @@ const SLASH_COMMANDS = [
         type: 1, // CHAT_INPUT
         options: [
             {
-                name: 'message',
+                name: 'text',
                 description: 'Describe the issue',
                 type: 3, // STRING
                 required: true,
