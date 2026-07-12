@@ -24,20 +24,79 @@ deployed, and did the hands-on debugging when things didn't work as expected.
    Auth instead of running NextAuth as a separate system — one fewer moving
    part, and Google OAuth is supported natively.
 
-3. [To be filled in as more decisions get made — e.g. deferred-response strategy,
-   dedup approach, Slack vs second-Discord-channel for the mirror.]
+3. **Column-level GRANT lockdown for mirror channel IDs instead of relying on
+   app-layer validation alone.** The AI's initial approach had the frontend
+   save `mirror_channel_id` directly via Supabase's REST API, gated only by a
+   pre-flight check route that validated guild ownership and bot permissions
+   before the save button was enabled. I realized this
+   REST API with a valid session token could bypass the Next.js route entirely
+   and write any `mirror_channel_id` value, because the RLS policy on
+   `command_configs` only checks row ownership, not whether the channel ID
+   itself is legitimate. The real fix had two layers: (a) at the database,
+   `REVOKE UPDATE` on the whole table then `GRANT UPDATE` on only the safe
+   columns — `mirror_channel_id` is deliberately excluded; (b) at the app
+   layer, a new route (`/api/discord/save-mirror-channel`) using the Supabase
+   secret key is now the sole write path for mirror fields, and it re-verifies
+   guild ownership and bot permissions server-side before writing. This was my
+   decision to push the security boundary down to Postgres rather than
+   trusting app-level checks.
 
 ## Hardest bug / wrong turn
-The AI initially scaffolded the interactions route file at
-`src/api/interactions/route.ts`. Next.js App Router requires API routes to live
-under `src/app/api/...`, not `src/api/...` — the missing `app` segment meant the
-route silently 404'd both locally and (before I caught it) would have 404'd in
-production too. I noticed because a curl/dev-server test returned 404 instead of
-the expected 401 (which is what an unsigned request to a working, signature-
-checking endpoint should return). Fixed by moving the file to the correct path.
-This was a good reminder to always verify a new endpoint responds with the
-*expected* error, not just "some" response, before assuming it's wired up right.
+
+The mirror channel security gap — and the cascading fix that followed — was the
+hardest problem in the project.
+
+**What happened:** The AI's initial approach had the frontend save
+`mirror_channel_id` directly via Supabase's REST API, with a separate pre-flight
+check route that validated guild ownership and bot permissions before the save
+button was enabled. This *looked* secure and passed
+manual testing. But I traced the actual write path and realized: RLS on
+`command_configs` only checks that the admin owns the *row* (via `guild_id` in
+`admin_guilds`). It doesn't validate that the `mirror_channel_id` *value* inside
+that row points to a channel the admin actually controls. Anyone with a valid
+session token could skip the pre-flight check, hit Supabase's REST API directly,
+and write a mirror channel ID pointing to a completely different server — as
+long as the bot happened to be present there, it would dutifully post into a
+channel outside the admin's control.
+
+**How I noticed:** Not from a test failure — from reading the RLS policies and
+asking "what actually stops a `PATCH` straight to PostgREST?" The answer was:
+nothing. The pre-flight check was a frontend gate, not an enforcement layer.
+
+**The fix, and its own cascading bug:** I revoked table-level `UPDATE` on
+`command_configs` for `authenticated` and granted it only on specific safe
+columns — deliberately excluding `mirror_channel_id`. The only write path for
+mirror fields became a new server-side route (`/api/discord/save-mirror-channel`)
+using the Supabase secret key, which re-verifies ownership and bot permissions
+itself before writing. But this immediately broke
+*unrelated* saves: the `enabled`/`rule` config upsert started failing with
+Postgres error `42501` (permission denied). Root cause: Supabase's
+`.upsert(..., { onConflict: 'guild_id,command_name' })` generates a
+`DO UPDATE SET` clause that reassigns the conflict-key columns (`guild_id`,
+`command_name`) even when their values don't change — and those columns weren't
+in the UPDATE grant. Fixed by adding them to the grant. A non-obvious
+PostgREST/Postgres interaction that no amount of app-level testing would have
+caught without understanding the generated SQL.
+
+*(Earlier, less interesting wrong turn: the AI initially placed the interactions
+route at `src/api/interactions/route.ts` instead of `src/app/api/...` — a silent
+404 caught by noticing the endpoint returned 404 instead of the expected 401 for
+an unsigned request.)*
 
 ## What I'd improve or add with more time
-[To be filled in near the end — stretch goals attempted vs skipped, anything
-left rough, what I'd harden for real production use.]
+
+1. **Interactive Discord components (buttons, modals).** The brief lists these
+   as stretch goals — `/report` opening a modal form, button follow-ups that
+   trigger a second verified interaction. The interaction types (`MESSAGE_COMPONENT`,
+   `MODAL_SUBMIT`) are already defined in the route handler but not handled yet.
+
+2. **Server-side paginated filtering on the logs page.** Currently the log page
+   fetches the last 50 interactions per guild and filters client-side. This is
+   fine for a live-tail view but won't scale to historical search. Extending it
+   would mean server-side queries with cursor-based pagination instead of
+   client-side `.filter()`.
+
+3. **Structured logging and observability.** Right now errors go to
+   `console.error` inside `after()`. For production: structured JSON logs,
+   correlation IDs tying an interaction through deferred processing → mirror
+   send, and a visible failure/retry history in the dashboard.

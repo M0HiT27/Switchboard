@@ -54,8 +54,7 @@ switchboard/
 │   │   │   ├── interactions/        # Discord interactions endpoint (POST)
 │   │   │   └── discord/
 │   │   │       ├── callback/        # OAuth callback handler
-│   │   │       ├── save-mirror-channel/  # Server-verified mirror channel write
-│   │   │       └── verify-channel/  # Mirror channel pre-check
+│   │   │       └── save-mirror-channel/  # Server-verified mirror channel write (sole write path)
 │   │   ├── auth/                    # Auth routes
 │   │   ├── dashboard/
 │   │   │   ├── page.tsx             # Connect-a-server flow

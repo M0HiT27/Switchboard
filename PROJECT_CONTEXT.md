@@ -28,10 +28,10 @@ Deadline: 72 hours from start (check original message timestamp for exact cutoff
 - **Discord interaction verification:** `discord-interactions` npm package
   (Ed25519 `verifyKey`)
 - **Mirror/notification channel:** a second Discord channel, posted to via bot
-  token (`src/lib/discord.ts`) — **DONE**, not Slack (decided against the Slack
-  webhook option in the brief in favor of Discord-to-Discord). Now includes
-  server-side ownership + live permission verification before any mirror
-  channel ID is saved — see "Mirror functionality" below.
+  token (`src/lib/Discord/discord.ts`) — **DONE**, not Slack (decided against
+  the Slack webhook option in the brief in favor of Discord-to-Discord). Now
+  includes server-side ownership + live permission verification before any
+  mirror channel ID is saved — see "Mirror functionality" below.
 - **Response pattern:** deferred (`type 5`) + follow-up `PATCH` on
   `/webhooks/{app_id}/{token}/messages/@original` — **DONE**. See "Deferred
   response + mirror" below.
@@ -51,8 +51,9 @@ Four client files under `src/lib/supabase/`:
   RLS-respecting. For Server Components / Server Actions / route handlers.
 - **`supabase-browser.ts`** — plain `supabase-js`, localStorage session. Dead
   code, confirmed no active imports remain. Safe to delete whenever.
-- **`supabase-server.ts`** — secret key, bypasses RLS. Only for the
-  interactions route and other no-user-session contexts.
+- **`supabase-server.ts`** (exports `createServerSupabaseClient()`) — secret
+  key, bypasses RLS. Only for the interactions route and other
+  no-user-session contexts.
 
 **Rule of thumb:** Discord-webhook-triggered code (no logged-in user) →
 `supabase-server.ts`. Logged-in-admin dashboard code → an `-auth-` client.
@@ -79,7 +80,7 @@ commands, OAuth2 redirect + Client Secret added for Supabase's Discord provider.
   deferred response is already sent
 - The real reply content lands via a **follow-up `PATCH`** to
   `/webhooks/{application_id}/{interaction_token}/messages/@original`
-  (`editOriginalInteractionResponse()` in `src/lib/discord.ts`)
+  (`editOriginalInteractionResponse()` in `src/lib/Discord/discord.ts`)
 - Wrapped in a catch-all `try/catch` inside `after()` so an unhandled error
   doesn't just vanish as a silent unhandled rejection — falls back to editing
   the original response with a generic error message
@@ -94,34 +95,39 @@ commands, OAuth2 redirect + Client Secret added for Supabase's Discord provider.
   within milliseconds should make Discord redeliveries rare in practice.
 
 ### Mirror functionality — DONE, now with server-verified writes
-`src/lib/discord.ts`:
+`src/lib/Discord/discord.ts` (**note the path**: this file lives under a
+capitalized `Discord/` subfolder — `src/lib/Discord/discord.ts`, not
+`src/lib/discord.ts`. Any fresh-session snippet or import statement should
+match the capitalized folder):
 - `sendDiscordMessage(channelId, content)` — posts via bot token
   (`Authorization: Bot ${DISCORD_BOT_TOKEN}`, no double-prefix)
 - `editOriginalInteractionResponse(interactionToken, content)` — PATCHes the
   deferred placeholder; authenticated by the interaction token itself in the
   URL, no Authorization header needed, valid 15 minutes post-interaction
-- `checkBotCanMirrorToChannel(guildId, channelId)` — **NEW**. Reads the
-  channel via Discord's API, confirms `channel.guild_id` matches the guild
-  being configured, then computes the bot's effective permissions in that
-  channel (role permissions + channel overwrites, via `BigInt` bitmath) to
-  confirm `View Channel` + `Send Messages`. Pure read-and-compute — never
-  sends a test message. Returns `{ ok: boolean, reason?: string }`.
+- `checkBotCanMirrorToChannel(guildId, channelId)` — reads the channel via
+  Discord's API, confirms `channel.guild_id` matches the guild being
+  configured, then computes the bot's effective permissions in that channel
+  (role permissions + channel overwrites, via `BigInt` bitmath) to confirm
+  `View Channel` + `Send Messages`. Pure read-and-compute — never sends a
+  test message. Returns `{ ok: boolean, reason?: string }`. This is the sole
+  remaining verification path now that `verify-channel` is gone (see below) —
+  it's called directly from `save-mirror-channel/route.ts`.
 
 Resolution order unchanged: per-command `command_configs.mirror_channel_id`
 overrides the guild-level `admin_guilds.default_mirror_channel_id`; if
 neither is set, mirroring is skipped. Won't mirror back into the same channel
 the command was run in.
 
-**Security hardening this session — mirror channel ID can no longer be
-hijacked to point at a server the admin doesn't own:**
+**Security hardening — mirror channel ID can no longer be hijacked to point
+at a server the admin doesn't own:**
 - Original gap: nothing stopped an admin from saving a `mirror_channel_id`
   belonging to a Discord server they don't administer (as long as the bot
   happened to be present there), causing the bot to post into a channel
   outside their control.
 - First attempt — a pre-flight `/api/discord/verify-channel` route that
-  checks guild ownership (via `admin_guilds`, RLS-backed) then calls
+  checked guild ownership (via `admin_guilds`, RLS-backed) then called
   `checkBotCanMirrorToChannel`. **Identified as insufficient**: this only
-  gates the *frontend's* save button. A request straight to Supabase's REST
+  gated the *frontend's* save button. A request straight to Supabase's REST
   API (valid session, publishable key) bypassing the Next.js route entirely
   could still write any `mirror_channel_id` value, because the RLS policy on
   `command_configs`/`admin_guilds` only checks *row ownership*
@@ -145,6 +151,24 @@ hijacked to point at a server the admin doesn't own:**
   in `CommandConfigClient.tsx` now call this route for the mirror field
   specifically, separate from the normal RLS-scoped upsert for the rest of
   the config.
+- **`/api/discord/save-mirror-channel/route.ts` — confirmed final shape:**
+  - Auth: `createAuthServerClient()` (cookie-based) to get the logged-in
+    user; 401 if none.
+  - Ownership: `admin_guilds` lookup scoped to `user_id` *and* `guild_id`
+    via `.maybeSingle()`; 403 with `"You don't administer this server."` if
+    no row comes back.
+  - Permission check: `checkBotCanMirrorToChannel(guildId, channelId)` is
+    only called when `channelId` is truthy — clearing the field
+    (`channelId: null`) skips the Discord round trip entirely, since there's
+    nothing to verify.
+  - Write: only after both checks pass, using `createServerSupabaseClient()`
+    (secret key) to `update()` either `admin_guilds.default_mirror_channel_id`
+    (scope `'guild'`) or `command_configs.mirror_channel_id` (scope
+    `'command'`, also bumps `updated_at`).
+  - Returns `{ ok: false, reason }` on any failure (missing fields, no
+    session, no ownership, failed permission check, or a Supabase error) and
+    `{ ok: true }` on success — matches what `CommandConfigClient.tsx`
+    already expects for its inline error display.
 - **Follow-up bug hit while wiring this up:** after the revoke/grant, saving
   a config's non-mirror fields (`enabled`/`rule`) started failing with
   `42501: permission denied for table command_configs`, even though
@@ -176,10 +200,16 @@ works (reply templates, enable/disable, keyword rules all rely on the same
 re-check against Discord's current guild-member permissions (using the human
 admin's Discord user ID, not just the bot's) would close it if there's time.
 
-**Still not built:** a "test mirror channel" UX button (the `verify-channel`
-route still exists and could be reused as a standalone check separate from
-the write path — currently redundant with `save-mirror-channel`'s own
-verification, decision on whether to keep both or consolidate is open).
+**`/api/discord/verify-channel` — REMOVED.** This route is deleted from the
+codebase. It was the original pre-flight check described above, and became
+fully redundant once `save-mirror-channel` started running the identical
+`checkBotCanMirrorToChannel` verification itself, server-side, on every
+write. There is currently no standalone "test this channel without saving"
+UX — verification only happens as part of an actual save. If a "test
+channel" button is wanted later, it would need to be rebuilt (or
+`save-mirror-channel` extended with a dry-run mode) rather than resurrecting
+the old route, since the old route's ownership check alone was already
+established as insufficient on its own.
 
 ### Command config UI — DONE, includes mirror fields + verification feedback + AI triage toggle
 `src/app/dashboard/config/page.tsx` (component: `CommandConfigClient.tsx`):
@@ -193,7 +223,7 @@ verification, decision on whether to keep both or consolidate is open).
 - Non-mirror fields save via the normal RLS-scoped upsert (`enabled`, `rule`,
   `updated_at`, plus `guild_id`/`command_name` as conflict keys); mirror
   fields save via the separate secret-key-backed route
-- **NEW this session — AI Triage toggle:** `rule.aiTriage` (boolean) added to
+- **AI Triage toggle:** `rule.aiTriage` (boolean) added to
   `CommandConfigRow['rule']`. Rides along inside the existing `rule` jsonb
   column, so no schema change and no `saveConfig()` change were needed — it's
   just another key in the same object already being upserted. UI is a
@@ -207,7 +237,7 @@ verification, decision on whether to keep both or consolidate is open).
 `schema.sql`: same three tables (`admin_guilds`, `interactions`,
 `command_configs`), plus:
 - `admin_guilds` UPDATE RLS policy (from earlier session, unchanged)
-- **NEW:** column-level privilege lockdown on both `command_configs` and
+- Column-level privilege lockdown on both `command_configs` and
   `admin_guilds` (see SQL block above) — `mirror_channel_id` and
   `default_mirror_channel_id` are not writable by the `authenticated` role
   at all; only the secret-key server route can set them.
@@ -218,7 +248,7 @@ verification, decision on whether to keep both or consolidate is open).
 
 ### Live command log page — DONE
 `src/app/dashboard/logs/page.tsx` (wrapped in `Suspense`, needed because the
-component reads `useSearchParams()`) + `command-log-client.tsx`:
+component reads `useSearchParams()`) + `CommandLogClient.tsx`:
 - Same guild-selector pattern as the config page for UX consistency
 - Initial fetch of the most recent 50 `interactions` rows for the selected
   guild (RLS-scoped, no new server route needed — this is exactly the read
@@ -243,12 +273,12 @@ component reads `useSearchParams()`) + `command-log-client.tsx`:
   value from one server's rules doesn't silently hide everything after
   switching to another. "Showing X of Y loaded" counter + a clear-filters
   button.
-- **NEW this session — `ai_summary` display, ready ahead of the backend:**
-  the `InteractionRow` type and Tag column already account for a future
-  `ai_summary` column — a small `Sparkles` icon renders next to the tag
-  badge whenever `row.ai_summary` is present, with the full summary shown on
-  hover. Currently inert in practice since no row has `ai_summary` populated
-  yet (backend not wired — see "Not started yet").
+- **`ai_summary` display, ready ahead of the backend:** the `InteractionRow`
+  type and Tag column already account for a future `ai_summary` column — a
+  small `Sparkles` icon renders next to the tag badge whenever
+  `row.ai_summary` is present, with the full summary shown on hover.
+  Currently inert in practice since no row has `ai_summary` populated yet
+  (backend not wired — see "Not started yet").
 - **TS fix hit while wiring the above:** lucide-react's icon prop types don't
   include `title`, so `<Sparkles title={row.ai_summary} />` failed to
   compile (`Property 'title' does not exist on type ... LucideProps`). Fixed
@@ -270,7 +300,7 @@ working — the Realtime subscription just kept streaming live rows to a
 hour). The one-time `getUser()` check in the initial load effect never fires
 again after mount, so nothing in the component learns about a sign-out that
 happened elsewhere.
-**Fix, two layers, both added to `command-log-client.tsx`:**
+**Fix, two layers, both added to `CommandLogClient.tsx`:**
 1. `supabase.auth.onAuthStateChange()` listener reacting to `SIGNED_OUT` —
    Supabase's `GoTrueClient` broadcasts auth events across same-origin tabs
    via `BroadcastChannel`, so a logout in Tab A fires this almost immediately
@@ -302,11 +332,10 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
    `command_configs`/`admin_guilds` checks row ownership, not whether
    `mirror_channel_id` itself is a legitimate reference. Closed by revoking
    table-level UPDATE and granting it only on specific columns, with the
-   secret-key-verified route as the sole write path for mirror fields. A
-   genuinely strong AI_NOTES.md "hardest bug" candidate — the interesting
-   part is that a client-side/API-level check (`verify-channel`) was
-   correctly identified as insufficient on its own, and the fix had to move
-   to the database layer.
+   secret-key-verified route as the sole write path for mirror fields. The
+   interesting part is that a client-side/API-level check (`verify-channel`,
+   since deleted) was correctly identified as insufficient on its own, and
+   the fix had to move to the database layer.
 6. **Column-level GRANT didn't include upsert conflict-key columns** —
    after locking down `mirror_channel_id`, unrelated saves started failing
    with a table-level `42501` because `.upsert(..., { onConflict: ... })`
@@ -320,14 +349,11 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
 - Apply the same two cross-tab-logout effects (`onAuthStateChange` +
   `visibilitychange` revalidation) to `CommandConfigClient.tsx` — same
   one-time `getUser()` exposure as the log page had before the fix
-- Decide fate of `/api/discord/verify-channel` (standalone reuse as a "test
-  channel" button, or remove since `save-mirror-channel` already verifies)
-- README.md, .env.example
-- AI_NOTES.md — needs the mirror-security-hardening entry, the
-  GRANT/upsert-conflict-key entry, the status/tag-column relabeling +
-  cross-tab-logout entries, and (once backend lands) the AI triage feature,
-  in addition to the existing candidates (client mismatch, RLS update-policy
-  gap, deferred-response redesign)
+- ~~Decide fate of `/api/discord/verify-channel`~~ — **DONE**, deleted as
+  redundant (`save-mirror-channel` already verifies)
+- ~~README.md, .env.example~~ — **DONE**
+- ~~AI_NOTES.md~~ — **DONE** (mirror-security-hardening entry,
+  GRANT/upsert-conflict-key entry, improvements section filled in)
 - **AI triage stretch goal — backend still to apply** (frontend toggle and
   log-page display are done, see above):
   - `schema.sql`: `alter table interactions add column if not exists ai_summary text;`
@@ -412,6 +438,12 @@ pages. `supabase-browser.ts` confirmed dead code, safe to delete.
   icon-with-native-tooltip pattern, wrap the icon in a plain element (e.g.
   `<span title="...">`) instead of passing `title` to the icon component
   directly.
+- **File path note:** the Discord helper module lives at
+  `src/lib/Discord/discord.ts` (capitalized `Discord/` folder) — confirmed
+  from the current `save-mirror-channel/route.ts`, which imports
+  `checkBotCanMirrorToChannel` from `@/lib/Discord/discord`. Earlier entries
+  in this file referencing plain `src/lib/discord.ts` have been corrected;
+  use the capitalized path in any new code or imports.
 
 ## Env vars in play
 ```
@@ -436,8 +468,8 @@ should include `.env*.local`.
 Paste this file into a new chat and say something like: "Continuing the
 Switchboard project — here's the context file, let's pick up from [wherever
 you left off]." Also paste `schema.sql`, all four Supabase client files, the
-interactions `route.ts`, `discord.ts`, `rules.ts`, `CommandConfigClient.tsx`,
-`save-mirror-channel/route.ts`, `verify-channel/route.ts`,
+interactions `route.ts`, `Discord/discord.ts`, `rules.ts`,
+`CommandConfigClient.tsx`, `save-mirror-channel/route.ts`,
 `CommandLogClient.tsx`, `dashboard/logs/page.tsx`, and `AI_NOTES.md` if
 starting completely fresh, since they carry detail this file only
-summarizes.
+summarizes. (`verify-channel/route.ts` no longer exists — don't include it.)
